@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Sensel Morph</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; color: #fff; font-family: monospace; display: flex; }
+    canvas { display: block; flex: 1; height: 100vh; }
+    #panel {
+      width: 260px; background: #111; padding: 14px;
+      display: flex; flex-direction: column; gap: 10px;
+      overflow-y: auto; font-size: 12px;
+    }
+    #log { color: #f88; font-size: 10px; white-space: pre-wrap; }
+    h3 { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 2px; margin-top: 6px; }
+    .row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px; }
+    .row label { color: #999; }
+    .row span  { color: #ffd080; }
+    input[type=range] { width: 100%; accent-color: #ffd080; cursor: pointer; }
+    button {
+      background: #1a1a1a; border: 1px solid #333; color: #aaa;
+      padding: 5px 10px; cursor: pointer; font-family: monospace; font-size: 11px; border-radius: 3px;
+    }
+    button.on { border-color: #ffd080; color: #ffd080; }
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="panel">
+  <div><b>Sensel Morph</b></div>
+  <div id="log">No data yet</div>
+  <div class="row"><label>Status</label><span id="s-status">—</span></div>
+  <div class="row"><label>Peak (g)</label><span id="s-peak">—</span></div>
+  <div class="row"><label>Max scale</label><span id="s-max">—</span></div>
+  <div class="row"><label>Contacts</label><span id="s-nc">—</span></div>
+  <div class="row"><label>FPS</label><span id="s-fps">—</span></div>
+
+  <h3>Scale</h3>
+  <button id="btn-as" class="on">Auto-scale</button>
+  <div class="row"><label>Max force (g)</label><span id="v-max">200</span></div>
+  <input type="range" id="sl-max" min="10" max="3000" step="10" value="200">
+
+  <h3>Diffusion</h3>
+  <div class="row"><label>Blur sigma</label><span id="v-blur">2.0</span></div>
+  <input type="range" id="sl-blur" min="0.1" max="8.0" step="0.1" value="2.0">
+
+  <h3>Tone</h3>
+  <div class="row"><label>Gamma</label><span id="v-gamma">0.5</span></div>
+  <input type="range" id="sl-gamma" min="0.1" max="2.0" step="0.05" value="0.5">
+
+  <h3>Display</h3>
+  <button id="btn-rot">Rotate [R]</button>
+
+  <h3>Capture</h3>
+  <div class="row"><label>Duration (s)</label><span id="v-dur">3</span></div>
+  <input type="range" id="sl-dur" min="1" max="10" step="1" value="3">
+  <button id="btn-rec">⏺ Record GIF</button>
+  <div id="rec-status" style="font-size:10px;color:#888;"></div>
+</div>
+
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl');
+const log = document.getElementById('log');
+
+function dbg(msg) { log.textContent = msg; }
+
+if (!gl) { dbg('WebGL not supported'); }
+
+const ROWS = 105, COLS = 185;
+
+// Float texture extension — required for float data
+const floatExt = gl.getExtension('OES_texture_float');
+if (!floatExt) dbg('ERROR: OES_texture_float not supported');
+
+// Linear filtering on float textures needs this
+const floatLinear = gl.getExtension('OES_texture_float_linear');
+const FILTER = floatLinear ? gl.LINEAR : gl.NEAREST;
+
+// ─── Shaders ─────────────────────────────────────────────────────────────────
+
+const VS = `
+  attribute vec2 a_pos;
+  attribute vec2 a_uv;
+  varying vec2 v_uv;
+  void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }
+`;
+
+// Simplest possible: sample texture, apply gamma, map to heat color
+const FS = `
+  precision mediump float;
+  uniform sampler2D u_tex;
+  uniform float u_max;
+  uniform float u_gamma;
+  uniform float u_blur_sigma;
+  uniform vec2  u_texel;
+  uniform int   u_rotated;
+  varying vec2 v_uv;
+
+  vec3 heat(float t) {
+    t = clamp(t, 0.0, 1.0);
+    if (t < 0.25) return mix(vec3(0,0,0),     vec3(0,0,1),     t/0.25);
+    if (t < 0.50) return mix(vec3(0,0,1),     vec3(0,1,1),     (t-0.25)/0.25);
+    if (t < 0.75) return mix(vec3(0,1,1),     vec3(1,0.5,0),   (t-0.50)/0.25);
+    return             mix(vec3(1,0.5,0),   vec3(1,1,1),     (t-0.75)/0.25);
+  }
+
+  float sample(vec2 uv) {
+    return texture2D(u_tex, uv).r;
+  }
+
+  void main() {
+    vec2 uv = v_uv;
+    if (u_rotated == 1) uv = vec2(1.0 - v_uv.y, v_uv.x);
+
+    // Simple 3x3 gaussian blur using u_blur_sigma
+    float s = u_blur_sigma;
+    float k0 = exp(0.0);
+    float k1 = exp(-1.0 / (2.0*s*s));
+    float k2 = exp(-2.0 / (2.0*s*s));
+
+    float val =
+      k2*(sample(uv + vec2(-2,-2)*u_texel) + sample(uv + vec2(2,-2)*u_texel) +
+          sample(uv + vec2(-2, 2)*u_texel) + sample(uv + vec2(2, 2)*u_texel)) +
+      k1*(sample(uv + vec2(-1,-1)*u_texel) + sample(uv + vec2(1,-1)*u_texel) +
+          sample(uv + vec2(-1, 1)*u_texel) + sample(uv + vec2(1, 1)*u_texel) +
+          sample(uv + vec2(-1, 0)*u_texel) + sample(uv + vec2(1, 0)*u_texel) +
+          sample(uv + vec2( 0,-1)*u_texel) + sample(uv + vec2(0, 1)*u_texel)) +
+      k0* sample(uv);
+    float wsum = 4.0*k2 + 8.0*k1 + k0;
+    val = val / wsum;
+
+    float t = pow(clamp(val / max(u_max, 0.001), 0.0, 1.0), u_gamma);
+    gl_FragColor = vec4(heat(t), 1.0);
+  }
+`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const err = gl.getShaderInfoLog(s);
+    dbg('SHADER ERROR:\n' + err);
+    console.error(err);
+    return null;
+  }
+  return s;
+}
+
+const vs = compileShader(gl.VERTEX_SHADER, VS);
+const fs = compileShader(gl.FRAGMENT_SHADER, FS);
+const prog = gl.createProgram();
+gl.attachShader(prog, vs);
+gl.attachShader(prog, fs);
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+  dbg('LINK ERROR:\n' + gl.getProgramInfoLog(prog));
+}
+
+// Quad
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1,-1, 0,1,   1,-1, 1,1,
+  -1, 1, 0,0,   1, 1, 1,0,
+]), gl.STATIC_DRAW);
+
+// Texture
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, FILTER);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, FILTER);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, COLS, ROWS, 0,
+              gl.LUMINANCE, gl.FLOAT, new Float32Array(ROWS * COLS));
+
+// ─── State ────────────────────────────────────────────────────────────────────
+
+let rotated = false;
+let autoScale = true;
+let maxForce = 10;
+let targetForce = new Float32Array(ROWS * COLS);
+let renderedForce = new Float32Array(ROWS * COLS);
+let prevTime = performance.now();
+let fpsFrames = 0, fpsTime = performance.now();
+
+// Slider values
+const P = { blur: 2.0, gamma: 0.5 };
+
+function bindSlider(slId, valId, key, fmt) {
+  const sl = document.getElementById(slId);
+  const vl = document.getElementById(valId);
+  sl.addEventListener('input', () => {
+    P[key] = parseFloat(sl.value);
+    vl.textContent = fmt ? fmt(P[key]) : P[key];
+  });
+}
+bindSlider('sl-blur',  'v-blur',  'blur',  v => v.toFixed(1));
+bindSlider('sl-gamma', 'v-gamma', 'gamma', v => v.toFixed(2));
+document.getElementById('sl-max').addEventListener('input', function() {
+  if (!autoScale) { maxForce = parseFloat(this.value); document.getElementById('v-max').textContent = maxForce; }
+});
+
+// ─── Resize ───────────────────────────────────────────────────────────────────
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.width  = (window.innerWidth - 260) + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+  canvas.width  = (window.innerWidth - 260) * dpr;
+  canvas.height = window.innerHeight * dpr;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ─── Uniform cache ────────────────────────────────────────────────────────────
+const U = {};
+function u(n) { return U[n] !== undefined ? U[n] : (U[n] = gl.getUniformLocation(prog, n)); }
+const aPos = gl.getAttribLocation(prog, 'a_pos');
+const aUv  = gl.getAttribLocation(prog, 'a_uv');
+
+// ─── Render loop ──────────────────────────────────────────────────────────────
+
+function render(now) {
+  const dt = Math.min((now - prevTime) / 1000, 0.1);
+  prevTime = now;
+
+  // Lerp toward target
+  const lf = 1 - Math.exp(-dt * 15);
+  for (let i = 0; i < renderedForce.length; i++)
+    renderedForce[i] += (targetForce[i] - renderedForce[i]) * lf;
+
+  // Auto-scale
+  if (autoScale) {
+    let peak = 0;
+    for (let i = 0; i < renderedForce.length; i++) if (renderedForce[i] > peak) peak = renderedForce[i];
+    if (peak > maxForce) maxForce = maxForce * 0.5 + peak * 0.5;
+    else maxForce = Math.max(maxForce * 0.9995, 10);
+    document.getElementById('v-max').textContent = Math.round(maxForce);
+    document.getElementById('sl-max').value = Math.min(maxForce, 3000);
+    document.getElementById('s-max').textContent = Math.round(maxForce);
+  }
+
+  // Upload texture
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, COLS, ROWS, 0,
+                gl.LUMINANCE, gl.FLOAT, renderedForce);
+
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  gl.useProgram(prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.enableVertexAttribArray(aPos);
+  gl.enableVertexAttribArray(aUv);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
+  gl.vertexAttribPointer(aUv,  2, gl.FLOAT, false, 16, 8);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(u('u_tex'),      0);
+  gl.uniform1f(u('u_max'),      maxForce);
+  gl.uniform1f(u('u_gamma'),    P.gamma);
+  gl.uniform1f(u('u_blur_sigma'), P.blur);
+  gl.uniform2f(u('u_texel'),    1.0/COLS, 1.0/ROWS);
+  gl.uniform1i(u('u_rotated'),  rotated ? 1 : 0);
+
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // FPS
+  fpsFrames++;
+  if (now - fpsTime > 500) {
+    document.getElementById('s-fps').textContent = Math.round(fpsFrames / ((now - fpsTime) / 1000));
+    fpsFrames = 0; fpsTime = now;
+  }
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+// ─── WebSocket ────────────────────────────────────────────────────────────────
+
+function connect() {
+  const ws = new WebSocket('ws://localhost:8765');
+  ws.onopen  = () => { document.getElementById('s-status').textContent = 'Connected'; };
+  ws.onclose = () => { document.getElementById('s-status').textContent = 'Disconnected'; setTimeout(connect, 2000); };
+  ws.onerror = (e) => { dbg('WS error: ' + e); };
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      const bin = atob(msg.force);
+      const ab  = new ArrayBuffer(bin.length);
+      const bv  = new Uint8Array(ab);
+      for (let i = 0; i < bin.length; i++) bv[i] = bin.charCodeAt(i);
+      targetForce = new Float32Array(ab);
+
+      let peak = 0;
+      for (let i = 0; i < targetForce.length; i++) if (targetForce[i] > peak) peak = targetForce[i];
+      document.getElementById('s-peak').textContent = peak.toFixed(1);
+      document.getElementById('s-nc').textContent   = msg.contacts.length;
+
+      dbg(`OK — rows:${msg.rows} cols:${msg.cols} peak:${peak.toFixed(1)}g contacts:${msg.contacts.length}`);
+    } catch(err) {
+      dbg('Parse error: ' + err);
+    }
+  };
+}
+connect();
+
+// ─── Controls ─────────────────────────────────────────────────────────────────
+document.getElementById('btn-rot').addEventListener('click', () => { rotated = !rotated; });
+document.getElementById('btn-as').addEventListener('click', function() {
+  autoScale = !autoScale;
+  this.classList.toggle('on', autoScale);
+});
+document.getElementById('sl-dur').addEventListener('input', function() {
+  document.getElementById('v-dur').textContent = this.value;
+});
+document.addEventListener('keydown', e => {
+  if (e.key==='r'||e.key==='R') rotated = !rotated;
+});
+
+// ─── GIF Recording ───────────────────────────────────────────────────────────
+// Uses MediaRecorder to capture canvas as webm, then converts frames to GIF
+// via a canvas-based encoder (no external library needed for webm download,
+// but for GIF we collect frames and encode with a small inline GIF writer).
+
+document.getElementById('btn-rec').addEventListener('click', async function() {
+  const btn = this;
+  const status = document.getElementById('rec-status');
+  const dur = parseInt(document.getElementById('sl-dur').value) * 1000;
+
+  if (btn.dataset.recording) return;
+  btn.dataset.recording = '1';
+  btn.textContent = '⏹ Recording…';
+  btn.classList.add('on');
+
+  // Collect canvas frames at ~15fps
+  const frames = [];
+  const frameInterval = 1000 / 15;
+  const startTime = performance.now();
+  status.textContent = 'Capturing frames…';
+
+  const captureFrame = () => {
+    if (performance.now() - startTime >= dur) {
+      finalize();
+      return;
+    }
+    // preserveDrawingBuffer must be true OR we capture right after draw
+    // We read pixels directly from the WebGL canvas
+    const w = canvas.width, h = canvas.height;
+    const pixels = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    frames.push({ pixels, w, h });
+    status.textContent = `Capturing… ${frames.length} frames`;
+    setTimeout(captureFrame, frameInterval);
+  };
+  captureFrame();
+
+  function finalize() {
+    status.textContent = `Encoding ${frames.length} frames…`;
+    btn.textContent = '⏺ Record GIF';
+    btn.classList.remove('on');
+    delete btn.dataset.recording;
+
+    // Encode as animated GIF using a temporary canvas + MediaRecorder trick:
+    // We render each frame to a 2D canvas (flipping Y — WebGL is bottom-up),
+    // collect as a video stream, then download as webm.
+    // Pure GIF encoding in JS is heavy; we output webm instead (plays everywhere).
+    const offscreen = document.createElement('canvas');
+    const scale = 0.5; // downsample for file size
+    offscreen.width  = Math.round(frames[0].w * scale);
+    offscreen.height = Math.round(frames[0].h * scale);
+    const ctx2d = offscreen.getContext('2d');
+    const stream = offscreen.captureStream(15);
+    const recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+    const chunks = [];
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: 'video/webm' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      a.href = url;
+      a.download = `sensel-${Date.now()}.webm`;
+      a.click();
+      URL.revokeObjectURL(url);
+      status.textContent = 'Saved!';
+      setTimeout(() => status.textContent = '', 3000);
+    };
+
+    recorder.start();
+    let fi = 0;
+    const tmp = document.createElement('canvas');
+    tmp.width = frames[0].w; tmp.height = frames[0].h;
+    const tmpCtx = tmp.getContext('2d');
+
+    function drawFrame() {
+      if (fi >= frames.length) { recorder.stop(); return; }
+      const { pixels, w, h } = frames[fi++];
+      // Flip Y (WebGL origin is bottom-left)
+      const imageData = tmpCtx.createImageData(w, h);
+      for (let y = 0; y < h; y++) {
+        const srcRow = (h - 1 - y) * w * 4;
+        const dstRow = y * w * 4;
+        imageData.data.set(pixels.subarray(srcRow, srcRow + w * 4), dstRow);
+      }
+      tmpCtx.putImageData(imageData, 0, 0);
+      ctx2d.drawImage(tmp, 0, 0, offscreen.width, offscreen.height);
+      setTimeout(drawFrame, frameInterval);
+    }
+    drawFrame();
+  }
+});
+</script>
+</body>
+</html>
