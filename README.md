@@ -2,14 +2,13 @@
 
 ## Demo
 
-<video src="demos/sensel-1774518654486.webm" controls width="100%"></video>
-<video src="demos/sensel-1774518666134.webm" controls width="100%"></video>
-<video src="demos/sensel-1774518680465.webm" controls width="100%"></video>
-<video src="demos/sensel-1774518693875.webm" controls width="100%"></video>
+[![Sensel Morph Linux Visualizer Demo](https://img.youtube.com/vi/LYtQcPp1yzM/maxresdefault.jpg)](https://www.youtube.com/watch?v=LYtQcPp1yzM)
 
 A complete Linux setup for the [Sensel Morph](https://sensel.com/pages/the-sensel-morph) pressure pad — from raw USB access to a GPU-accelerated live heatmap visualizer running in your browser.
 
 The Sensel Morph has 19,425 independent pressure sensors (185×105 grid). This project gives you full access to all of them.
+
+
 
 ---
 
